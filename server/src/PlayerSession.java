@@ -13,6 +13,10 @@ public class PlayerSession
     public volatile List<String> update2BFields = Collections.emptyList();
     public volatile List<String> update3Fields = Collections.emptyList();
 
+    // NPC sync: NPCs hosted by this player. Single concatenated payload
+    // (multiple NPCs separated by '|' inside one string field).
+    public volatile List<String> updateNpcFields = Collections.emptyList();
+
     public PlayerSession(String username, ClientEndpoint endpoint, long lastSeen)
     {
         this.username = username;

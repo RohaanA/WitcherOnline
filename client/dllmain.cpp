@@ -45,6 +45,9 @@ struct ExecJob {
 static std::mutex g_qMu;
 static std::vector<ExecJob> g_jobs;
 
+static void LogStep(const char* msg);
+static bool SendOneShotExec(const std::string& code);
+
 fs::path getExecutablePath() {
 	char buffer[MAX_PATH];
 	GetModuleFileNameA(NULL, buffer, MAX_PATH);
@@ -281,8 +284,9 @@ void pushPlayer(const std::string& id, const std::vector<std::string>& update1A,
 
 	code2 += ")";
 
-	g_client.ExecNoWaitLatest("wo1:" + id, code1);
-	g_client.ExecNoWaitLatest("wo2:" + id, code2);
+	// Deck-friendly: g_client may not be started; use one-shot TCP instead.
+	SendOneShotExec(code1);
+	SendOneShotExec(code2);
 
 	//std::cout << "Code1: " << code1 << "\n";
 	//std::cout << "Code2: " << code2 << "\n";
@@ -338,7 +342,7 @@ static void pushPlayer3(const std::string& id, const std::vector<std::string>& u
 	code3 += EscapeExecQuoted(gwentData, '"');
 	code3 += "\")";
 
-	g_client.ExecNoWaitLatest("wo3:" + id, code3);
+	SendOneShotExec(code3);
 }
 
 static void CloseOnlineSession()
@@ -401,6 +405,90 @@ static void HandleServerPacket(const std::string& msg)
 		CloseOnlineSession();
 		return;
 	}
+	else if (parts[0] == "UPDATE_NPC")
+	{
+		// parts[1] = host username, parts[2] = serialized NPC payload (single field).
+		// We inject wo_npc_update(host, payload) into the game.
+		// Coalescing key: "npc:<host>" — drop stale updates if newer arrives first.
+		if (parts.size() < 3)
+			return;
+
+		const std::string& hostId = parts[1];
+		const std::string& payload = parts[2];
+
+		if (hostId.empty() || payload.empty())
+			return;
+
+		// Self-echo filter: don't render our own NPCs as remotes (would double them).
+		if (hostId == username)
+			return;
+
+		std::string code = "wo_npc_update(\"";
+		code += EscapeExecQuoted(hostId, '"');
+		code += "\", \"";
+		code += EscapeExecQuoted(payload, '"');
+		code += "\")";
+
+		// Deck-friendly: one-shot TCP push instead of background queue.
+		SendOneShotExec(code);
+		return;
+	}
+	else if (parts[0] == "UPDATE_HIT")
+	{
+		// parts[1] = attacker username, parts[2] = payload "<host> <npcId> <damage>|<host> ..."
+		// Host applies damage to NPC by ID. Attacker is informational (could be used for kill credit).
+		if (parts.size() < 3)
+			return;
+
+		const std::string& attackerId = parts[1];
+		const std::string& payload = parts[2];
+
+		if (payload.empty())
+			return;
+
+		std::string code = "wo_apply_hit(\"";
+		code += EscapeExecQuoted(attackerId, '"');
+		code += "\", \"";
+		code += EscapeExecQuoted(payload, '"');
+		code += "\")";
+
+		// Deck-friendly: one-shot TCP push (also handles hits)
+		SendOneShotExec(code);
+		return;
+	}
+	else if (parts[0] == "UPDATE_EXEC")
+	{
+		// Verbatim exec relay: parts[2] = '|'-separated exec strings to inject as-is.
+		// The engine binds quoted tokens to typed params (e.g. wo_give_item('X',1) -> name),
+		// which is how we move items cross-process without WS string->name.
+		if (parts.size() < 3)
+			return;
+
+		const std::string& sender = parts[1];
+		const std::string& payload = parts[2];
+		if (payload.empty())
+			return;
+		if (sender == username)   // self-echo: don't run our own queued action
+			return;
+
+		size_t start = 0;
+		while (start <= payload.size())
+		{
+			size_t bar = payload.find('|', start);
+			std::string code = (bar == std::string::npos)
+				? payload.substr(start)
+				: payload.substr(start, bar - start);
+
+			// Guard: only inject our own wo_* helpers, never arbitrary remote code.
+			if (code.rfind("wo_", 0) == 0)
+				SendOneShotExec(code);
+
+			if (bar == std::string::npos)
+				break;
+			start = bar + 1;
+		}
+		return;
+	}
 	else if (
 		parts[0] == "UPDATE1A" ||
 		parts[0] == "UPDATE1B" ||
@@ -429,7 +517,9 @@ static void HandleServerPacket(const std::string& msg)
 		std::vector<std::string> u2b;
 
 		{
-			std::lock_guard<std::mutex> lk(remoteMu);
+			// Deck workaround: std::mutex/lock_guard crashes under Wine.
+			// HandleServerPacket is called only from SendToGameThread (single-threaded),
+			// so we can safely skip the lock.
 			auto& rp = remotePlayers[id];
 
 			if (opcode == "UPDATE1A")
@@ -478,24 +568,84 @@ static void HandleServerPacket(const std::string& msg)
 	}
 }
 
+// One-shot TCP push for Wine/Deck: open, bind, exec, close.
+// No threading, no mutex, no condition variables. Synchronous.
+static bool SendOneShotExec(const std::string& code)
+{
+	SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == INVALID_SOCKET) return false;
+
+	BOOL one = TRUE;
+	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof(one));
+	int to = 500;
+	setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to, sizeof(to));
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof(to));
+
+	sockaddr_in addr{};
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(37001);
+	if (InetPtonA(AF_INET, "127.0.0.1", &addr.sin_addr) != 1)
+	{
+		closesocket(s);
+		return false;
+	}
+
+	if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
+	{
+		closesocket(s);
+		return false;
+	}
+
+	// Send bind packets followed by exec, in single burst.
+	auto b1 = w3mp::Bind("Remote");
+	auto b2 = w3mp::Bind("scripts");
+	auto pkt = w3mp::ExecutePacket(code);
+
+	std::vector<uint8_t> burst;
+	burst.insert(burst.end(), b1.begin(), b1.end());
+	burst.insert(burst.end(), b2.begin(), b2.end());
+	burst.insert(burst.end(), pkt.begin(), pkt.end());
+
+	const uint8_t* p = burst.data();
+	int n = (int)burst.size();
+	while (n > 0)
+	{
+		int r = send(s, (const char*)p, n, 0);
+		if (r <= 0) { closesocket(s); return false; }
+		p += r; n -= r;
+	}
+
+	closesocket(s);
+	return true;
+}
+
 static void PollPoseThread() {
+	LogStep("PollPoseThread: ENTER");
 	Sleep(500);
+	LogStep("PollPoseThread: after sleep, entering main loop");
 	using clock = std::chrono::steady_clock;
+	auto lastDebugLog = clock::now();
+	int iterLog = 0;
 
 	while (g_run.load()) {
+		if (iterLog < 5) { LogStep("PPT: A. loop top"); }
+		// File log every 3 sec to see if poll runs and g_client status
+		auto now = clock::now();
+		if (now - lastDebugLog > std::chrono::seconds(3)) {
+			std::string s = "PollPoseTick: g_client.IsConnected=";
+			s += g_client.IsConnected() ? "TRUE" : "FALSE";
+			LogStep(s.c_str());
+			lastDebugLog = now;
+		}
+		if (iterLog < 5) { LogStep("PPT: B. after time check"); }
+		if (iterLog < 5) { LogStep("PPT: B1. about to try block"); }
+
 
 		try
 		{
-			{
-				std::vector<ExecJob> jobs;
-				{ std::lock_guard<std::mutex> lk(g_qMu); jobs.swap(g_jobs); }
-				for (auto& j : jobs) {
-					if (!g_client.IsConnected())
-						break;
-					std::string out;
-					g_client.ExecTagged(j.code, j.tag, out, j.timeoutMs);
-				}
-			}
+			if (iterLog < 5) { LogStep("PPT: B2. in try"); }
+			// DECK: skip mutex+drain (suspect mutex on Wine)
+			if (iterLog < 5) { LogStep("PPT: B5. after drain block (skipped)"); }
 
 			if (g_client.IsConnected() && g_usernameTaken.load())
 			{
@@ -522,192 +672,241 @@ static void PollPoseThread() {
 				continue;
 			}
 
+			if (iterLog < 5) { LogStep("PPT: B6. before main connected check"); }
+
+			// Deck heartbeat: when no debug-scripts connection (Wine workaround mode),
+			// still send a minimal UPDATE1A to keep server registration alive.
+			static auto lastHeartbeat = clock::now();
+			if (!g_client.IsConnected() && (now - lastHeartbeat) > std::chrono::seconds(2))
+			{
+				lastHeartbeat = now;
+				try {
+					std::string packet = "UPDATE1A\t" + username + "\theartbeat";
+					theSocket.send(asio::buffer(packet));
+				} catch (...) {}
+			}
+
 			if (g_client.IsConnected()) {
 
-				std::string out;
-				bool ok = g_client.ExecTagged("wo_get(\"" + username + "\")", "wo", out, 500);
+				// Per-cycle counter to throttle rarely-changing data (appearance).
+				static uint32_t cycle = 0;
+				++cycle;
 
-				if (ok)
-				{
-					ParsedHalves halves = ParseValuesSplitHalf(out);
+				// Timeout for exec round-trips. Lower than the old 3000ms to cap worst-case
+				// hitch when a reply is dropped, while staying generous enough for Wine's
+				// batched debug-script replies.
+				const int kTimeout = 1500;
 
-					std::string packet1a = BuildPacket("UPDATE1A", username, halves.first);
-					std::string packet1b = BuildPacket("UPDATE1B", username, halves.second);
-
-					//std::cout << "Got data 1A (" << packet1a.size() << " bytes): " << packet1a << "\n";
-					//std::cout << "Got data 1B (" << packet1b.size() << " bytes): " << packet1b << "\n";
-
+				// Helper: exec a "halves"-style getter and send two UPDATE packets.
+				// Returns false only on a failed round-trip (caller may ignore).
+				auto pushHalves = [&](const char* fn, const char* tag,
+				                      const char* opA, const char* opB) -> bool {
+					std::string out;
+					std::string code = std::string(fn) + "(\"" + username + "\")";
+					if (!g_client.ExecTagged(code, tag, out, kTimeout))
+						return false;
+					ParsedHalves h = ParseValuesSplitHalf(out);
 					try {
-						if (!halves.first.empty())
-							theSocket.send(asio::buffer(packet1a));
+						if (!h.first.empty())
+							theSocket.send(asio::buffer(BuildPacket(opA, username, h.first)));
+						if (!h.second.empty())
+							theSocket.send(asio::buffer(BuildPacket(opB, username, h.second)));
+					} catch (...) {}
+					return true;
+				};
 
-						if (!halves.second.empty())
-							theSocket.send(asio::buffer(packet1b));
-					}
-					catch (const std::exception& e) {
-						std::cout << "Send error (wo_get halves): " << e.what() << "\n";
-					}
-				}
-				else
-				{
-					std::cout << "Failed to get Data 1 " << out << std::endl;
-				}
-
-				std::string out2;
-				bool ok2 = g_client.ExecTagged("wo_get2(\"" + username + "\")", "wo2", out2, 500);
-
-				if (ok2)
-				{
-					ParsedHalves halves2 = ParseValuesSplitHalf(out2);
-
-					std::string packet2a = BuildPacket("UPDATE2A", username, halves2.first);
-					std::string packet2b = BuildPacket("UPDATE2B", username, halves2.second);
-
-					//std::cout << "Got data 2A (" << packet2a.size() << " bytes): " << packet2a << "\n";
-					//std::cout << "Got data 2B (" << packet2b.size() << " bytes): " << packet2b << "\n";
-
+				// Helper: exec a single-string-payload getter (NPC / hits), strip the
+				// "<tag> " prefix, send one packet. Empty payload => nothing sent.
+				auto pushPayload = [&](const char* fn, const char* tag,
+				                       const char* opcode) {
+					std::string out;
+					std::string code = std::string(fn) + "(\"" + username + "\")";
+					if (!g_client.ExecTagged(code, tag, out, kTimeout))
+						return;
+					std::string prefix = std::string(tag) + " ";
+					if (out.size() >= prefix.size() && out.compare(0, prefix.size(), prefix) == 0)
+						out.erase(0, prefix.size());
+					else if (out == tag)        // bare tag marker => empty
+						out.clear();
+					if (out.empty())
+						return;
+					std::vector<std::string> fields;
+					fields.push_back(out);
 					try {
-						if (!halves2.first.empty())
-							theSocket.send(asio::buffer(packet2a));
+						theSocket.send(asio::buffer(BuildPacket(opcode, username, fields)));
+					} catch (...) {}
+				};
 
-						if (!halves2.second.empty())
-							theSocket.send(asio::buffer(packet2b));
-					}
-					catch (const std::exception& e) {
-						std::cout << "Send error (wo_get2 halves): " << e.what() << "\n";
-					}
-				}
-				else
-				{
-					std::cout << "Failed to get Data 2 " << out2 << std::endl;
-				}
+				// --- Every cycle: position/state (latency-critical) ---
+				pushHalves("wo_get", "wo", "UPDATE1A", "UPDATE1B");
 
-				std::string out3;
-				bool ok3 = g_client.ExecTagged("wo_get3(\"" + username + "\")", "wo3", out3, 500);
+				// --- Throttled: appearance changes rarely (armor swap). Every 30 cycles. ---
+				if (cycle % 30 == 0)
+					pushHalves("wo_get2", "wo2", "UPDATE2A", "UPDATE2B");
 
-				if (ok3)
-				{
-					ParsedHalves halves3 = ParseValuesSplitHalf(out3);
+				// --- wo_get3 (gwent) removed: gwent multiplayer disabled on both sides. ---
 
-					std::vector<std::string> fields3;
-					fields3.reserve(halves3.first.size() + halves3.second.size());
-					fields3.insert(fields3.end(), halves3.first.begin(), halves3.first.end());
-					fields3.insert(fields3.end(), halves3.second.begin(), halves3.second.end());
+				// --- Every cycle: NPC sync + hit queue ---
+				pushPayload("wo_get_npcs", "wo_npc", "UPDATE_NPC");
+				pushPayload("wo_get_pending_hits", "wo_hit", "UPDATE_HIT");
 
-					std::string packet3 = BuildPacket("UPDATE3", username, fields3);
-
-					//std::cout << "Got data 3 (" << out3.size() << " bytes): " << out3 << "\n";
-					//std::cout << "Sending packet3: " << packet3 << "\n";
-
-					try {
-						if (!fields3.empty())
-							theSocket.send(asio::buffer(packet3));
-					}
-					catch (const std::exception& e) {
-						std::cout << "Send error (wo_get3): " << e.what() << "\n";
-					}
-				}
-				else
-				{
-					std::cout << "Failed to get Data 3 " << out3 << std::endl;
-				}
+				// --- Throttled: verbatim exec relay (item give / drops). Rare -> every 8 cycles. ---
+				if (cycle % 8 == 0)
+					pushPayload("wo_get_pending_exec", "wo_exec", "UPDATE_EXEC");
 			}
 			else
 			{
-				std::cout << "Not connected to game..." << std::endl;
+				if (iterLog < 5) { LogStep("PPT: C. about to sleep 100"); }
 				Sleep(100);
+				if (iterLog < 5) { LogStep("PPT: D. after sleep 100"); iterLog++; }
 			}
+		}
+		catch (const std::exception& e)
+		{
+			std::string s = "PPT: caught std::exception: ";
+			s += e.what();
+			LogStep(s.c_str());
 		}
 		catch (...)
 		{
-			std::cout << "caught exception in main loop" << std::endl;
+			LogStep("PPT: caught unknown exception");
 		}
 	}
 }
 
 static void SendToGameThread()
 {
+	LogStep("SendToGameThread: ENTER");
 	Sleep(1000);
+	LogStep("SendToGameThread: after sleep, entering recv loop");
 	std::vector<char> data(8192);
 
+	int tick = 0;
 	while (g_run.load())
 	{
 		try
 		{
+			if (tick < 3) { LogStep("SendToGameThread: about to recv_from"); }
 			asio::ip::udp::endpoint senderEndpoint;
 
 			std::size_t len = theSocket.receive_from(
 				asio::buffer(data),
 				senderEndpoint
 			);
+			if (tick < 3) { LogStep("SendToGameThread: recv_from returned"); }
 
 			std::string msg(data.data(), len);
 			HandleServerPacket(msg);
-			//std::cout << "Receive packet: " << msg << "\n";
 		}
 		catch (const std::exception& e) {
-			std::cout << "Receive error: " << e.what() << "\n";
+			std::string s = "SendToGameThread recv exception: ";
+			s += e.what();
+			LogStep(s.c_str());
 			Sleep(500);
 		}
+		catch (...) {
+			LogStep("SendToGameThread unknown exception");
+			Sleep(500);
+		}
+		tick++;
+	}
+}
+
+// Wine-friendly file logger.
+static void LogStep(const char* msg)
+{
+	FILE* f = nullptr;
+	fopen_s(&f, "C:\\witcher_dll_log.txt", "a");
+	if (f)
+	{
+		fprintf(f, "%s\n", msg);
+		fclose(f);
 	}
 }
 
 void initScript()
 {
+	LogStep("S0: enter initScript");
+
+	// Skip when not running inside the main game exe (launcher.exe etc load dinput8 too).
+	{
+		char procPath[MAX_PATH] = {0};
+		GetModuleFileNameA(NULL, procPath, MAX_PATH);
+		std::string p(procPath);
+		for (auto& c : p) c = (char)tolower((unsigned char)c);
+		LogStep((std::string("S0a: proc = ") + p).c_str());
+		if (p.find("witcher3.exe") == std::string::npos)
+		{
+			LogStep("S0a: not witcher3.exe, abort init");
+			return;
+		}
+	}
+
+	// Disable std::cout/cerr globally -- without an allocated console (which we no longer
+	// activate to avoid Wine crashes), cout writes may crash on Wine/Proton.
+	std::cout.rdbuf(nullptr);
+	std::cerr.rdbuf(nullptr);
+	std::clog.rdbuf(nullptr);
+	LogStep("S0b: cout disabled");
+
 	fs::path baseDir = getExecutablePath();
+	LogStep("S1: got executable path");
+
 	fs::path fullPath = baseDir / "WitcherOnline" / "config.xml";
+	{
+		std::string s = "S2: config path = ";
+		s += fullPath.string();
+		LogStep(s.c_str());
+	}
 
 	pugi::xml_document doc;
 	pugi::xml_parse_result result = doc.load_file(fullPath.c_str());
-
-	if (!result) {
-		std::cout << "Failed to load config file: " << fullPath << std::endl;
-		return;
-	}
+	LogStep(result ? "S3: config loaded OK" : "S3: config load FAILED");
+	if (!result) return;
 
 	pugi::xml_node xml = doc.child("Config");
-
-	if (!xml)
-	{
-		return;
-	}
+	if (!xml) { LogStep("S4: no <Config> root"); return; }
+	LogStep("S4: <Config> root OK");
 
 	std::string user = xml.child("Username").text().as_string();
-
 	username = std::regex_replace(user, std::regex("[^A-Za-z0-9_]"), "");
-
-	if (username.length() > 16)
-	{
-		username.resize(16);
-	}
+	if (username.length() > 16) username.resize(16);
 
 	std::string ip = xml.child("ServerIP").text().as_string();
 	std::string port = xml.child("Port").text().as_string();
-
-	if (ip.empty() || username.empty() || username.length() < 2)
 	{
-		return;
+		std::string s = "S5: user=" + username + " ip=" + ip + " port=" + port;
+		LogStep(s.c_str());
 	}
 
-	std::cout << "Username: " << username << std::endl;
-	std::cout << "IP: " << ip << std::endl;
-	std::cout << "Port: " << port << std::endl;
-	std::cout << fullPath << std::endl;
+	if (ip.empty() || username.empty() || username.length() < 2) { LogStep("S5b: bad config, return"); return; }
 
-	if (g_shutdown.load())
-		return;
+	if (g_shutdown.load()) { LogStep("S5c: shutdown, return"); return; }
 
+	LogStep("S6: g_client.Start() (Wine-safe: CRITICAL_SECTION/CONDITION_VARIABLE)");
 	g_client.Start();
+	LogStep("S7: g_client.Start() returned");
 
 	g_run.store(true);
+	LogStep("S8: g_run set");
 
 	theSocket.open(asio::ip::udp::v4());
+	LogStep("S9: socket open");
+
 	theSocket.bind(asio::ip::udp::endpoint(asio::ip::udp::v4(), 0));
+	LogStep("S10: socket bind");
+
 	serverEndpoint = *resolver.resolve(asio::ip::udp::v4(), ip, port).begin();
+	LogStep("S11: resolved server");
+
 	theSocket.connect(serverEndpoint);
+	LogStep("S12: socket connect");
 
 	g_poll = std::thread(PollPoseThread);
+	LogStep("S13: poll thread spawned");
+
 	g_game = std::thread(SendToGameThread);
+	LogStep("S14: game thread spawned, init complete");
 }
 
 static DWORD WINAPI InitThreadProc(LPVOID)
@@ -715,11 +914,7 @@ static DWORD WINAPI InitThreadProc(LPVOID)
 	if (g_shutdown.load())
 		return 0;
 
-	//activateConsole();
-
-	if (g_shutdown.load())
-		return 0;
-
+	// activateConsole();  // disabled (crashes on Wine)
 	initScript();
 	return 0;
 }

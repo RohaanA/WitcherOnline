@@ -398,3 +398,13 @@ bin/
 .DS_Store
 
 .idea/
+### Co-op fork build artifacts (not source) ###
+client/build/
+client/build*/
+server/build/
+*.class
+*.bak
+# local log-relay scratch
+deck_scriptslog.txt
+relay_log.txt
+relay_err.txt

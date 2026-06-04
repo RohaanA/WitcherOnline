@@ -141,7 +141,8 @@ public class WitcherServer
                 || "UPDATE1B".equals(opcode)
                 || "UPDATE2A".equals(opcode)
                 || "UPDATE2B".equals(opcode)
-                || "UPDATE3".equals(opcode);
+                || "UPDATE3".equals(opcode)
+                || "UPDATE_NPC".equals(opcode);
     }
 
     private static void handleMessage(DatagramSocket socket, ClientEndpoint sender, String msg) throws Exception
@@ -154,6 +155,35 @@ public class WitcherServer
         }
 
         String opcode = parts[0];
+
+        // UPDATE_HIT and UPDATE_EXEC — transient one-shot events. Broadcast immediately, no
+        // per-session storage (replaying every tick would re-fire the action). UPDATE_EXEC
+        // carries a verbatim exec string (e.g. give-item) the receiver's DLL injects.
+        if ("UPDATE_HIT".equals(opcode) || "UPDATE_EXEC".equals(opcode))
+        {
+            List<ClientEndpoint> recipients = snapshotRecipients();
+            if ("UPDATE_EXEC".equals(opcode))
+            {
+                dbg("UPDATE_EXEC from %s -> broadcast to %d recipient(s): %s\n",
+                        parts.length > 1 ? parts[1] : "?",
+                        recipients.size(),
+                        parts.length > 2 ? parts[2] : "");
+            }
+            byte[] data = msg.getBytes(StandardCharsets.UTF_8);
+            for (ClientEndpoint client : recipients)
+            {
+                try
+                {
+                    socket.send(new DatagramPacket(data, data.length, client.address, client.port));
+                    totalPacketsSent.incrementAndGet();
+                }
+                catch (Exception e)
+                {
+                    totalSendFailures.incrementAndGet();
+                }
+            }
+            return;
+        }
 
         if (!isUpdateOpcode(opcode))
         {
@@ -298,6 +328,10 @@ public class WitcherServer
         {
             current.update3Fields = frozenFields;
         }
+        else if ("UPDATE_NPC".equals(opcode))
+        {
+            current.updateNpcFields = frozenFields;
+        }
     }
 
     private static void cleanupLoop()
@@ -363,6 +397,7 @@ public class WitcherServer
                     packetsSentThisTick += broadcastChunk(socket, recipients, session, "UPDATE2A", session.update2AFields);
                     packetsSentThisTick += broadcastChunk(socket, recipients, session, "UPDATE2B", session.update2BFields);
                     packetsSentThisTick += broadcastChunk(socket, recipients, session, "UPDATE3", session.update3Fields);
+                    packetsSentThisTick += broadcastChunk(socket, recipients, session, "UPDATE_NPC", session.updateNpcFields);
                 }
 
                 totalPacketsSent.addAndGet(packetsSentThisTick);
@@ -381,7 +416,7 @@ public class WitcherServer
                     lastHeartbeat = now;
                 }
 
-                Thread.sleep(100);
+                Thread.sleep(50);   // 20Hz broadcast: halves host->guest staleness vs old 100ms
             }
             catch (InterruptedException e)
             {

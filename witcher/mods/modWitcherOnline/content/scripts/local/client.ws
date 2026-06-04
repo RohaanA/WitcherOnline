@@ -335,10 +335,11 @@ statemachine class r_MultiplayerClient
         deck = gwentGame.deck;
 
         gwintManager = theGame.GetGwintManager();
-        gwintManager.SetEnemyDeckFromMultiplayer(deck);
-        gwintManager.multiplayerSeed = seed;
-        gwintManager.multiplayerIsHost = host;
-        gwintManager.multiplayerIsTimed = (type == GG_Timed);
+        // Disabled: multiplayer gwent API отсутствует в этой версии W3.
+        // gwintManager.SetEnemyDeckFromMultiplayer(deck);
+        // gwintManager.multiplayerSeed = seed;
+        // gwintManager.multiplayerIsHost = host;
+        // gwintManager.multiplayerIsTimed = (type == GG_Timed);
         gwintManager.gameRequested = true;
         gwintManager.testMatch = true;
 
@@ -357,7 +358,8 @@ statemachine class r_MultiplayerClient
             menu = (CR4GwintGameMenu)theGame.GetGuiManager().GetRootMenu();
             if(menu)
             {
-                menu.ReceiveRemoteGwentAction(action);
+                // Disabled: ReceiveRemoteGwentAction отсутствует в этой версии W3.
+                // menu.ReceiveRemoteGwentAction(action);
             }
         }
     }
@@ -418,7 +420,8 @@ statemachine class r_MultiplayerClient
         gwentLastCompleted = theGame.GetEngineTimeAsSeconds();
         activeGwentBet = 0;
         activeGwentSeed = 0;
-        theGame.GetGwintManager().ClearMultiplayerState();
+        // Disabled: ClearMultiplayerState отсутствует в этой версии W3.
+        // theGame.GetGwintManager().ClearMultiplayerState();
     }
 
     public function settleGwentBet(localPlayerWon : bool)

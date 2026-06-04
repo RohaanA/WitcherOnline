@@ -1,13 +1,12 @@
 #pragma once
 #include "NetProto.h"
 #include <atomic>
-#include <condition_variable>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
 #include <vector>
 #include <winsock2.h>
+#include <windows.h>
 #include <deque>
 #include <unordered_map>
 
@@ -43,23 +42,26 @@ namespace w3mp {
 		std::thread worker_;
 		std::atomic<bool> running_{ false };
 
-		std::mutex req_mu_;
-		std::condition_variable req_cv_;
+		// Wine workaround: use Win32 native CRITICAL_SECTION/CONDITION_VARIABLE
+		// instead of std::mutex/std::condition_variable (which crash under Proton).
+		CRITICAL_SECTION req_cs_;
+		CONDITION_VARIABLE req_cv_;
 		bool has_req_ = false;
 		std::string req_code_;
 		std::string req_tag_;
 
-		std::condition_variable rep_cv_;
+		CONDITION_VARIABLE rep_cv_;
 		std::optional<std::string> req_reply_;
 
 		bool req_sent_ = false;
 
 		void ThreadMain();
+		void ThreadMainImpl();
 
 		static void Utf8Sink(const std::string& s, void* user);
 		void OnUtf8(const std::string& s);
 
-		std::mutex ff_mu_;
+		CRITICAL_SECTION ff_cs_;
 		std::deque<std::string> ff_q_;
 
 		std::unordered_map<std::string, std::string> ff_latest_;

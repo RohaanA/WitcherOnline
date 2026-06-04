@@ -1,83 +1,103 @@
-# Witcher Online
-<div align="left">
-  <a href="https://www.youtube.com/watch?v=E36I77ardm4">
-    <img
-      src="https://github.com/user-attachments/assets/2f2c39ab-7d48-4095-8a89-56fbede324ef"
-    >
-  </a>
-</div>
+# Witcher Online — Co-op / NPC-sync fork
 
-**Witcher Online** is a mod that adds multiplayer to *The Witcher 3: Wild Hunt*, turning your single player experience into an MMO experience. Join servers to play with your friends, customize your character using [Custom Player Characters](https://www.nexusmods.com/witcher3/mods/5940) and relax in taverns using [Chill Out](https://www.nexusmods.com/witcher3/mods/6402). Chat with strangers and perform emotes to roleplay with other players. Complete quests alongside friends.
+> A fork of [Witcher Online](https://www.nexusmods.com/witcher3/mods/11590) that adds the one thing its
+> README says is missing: **"Co-op, world, and NPC sync."** It turns the presence-only multiplayer into a
+> Dark-Souls-style **shared world** where a guest sees and fights the host's NPCs.
 
-## Getting started
-To play Witcher Online, go to the [nexus page](https://www.nexusmods.com/witcher3/mods/11590).
+**Status:** working cross-device prototype (PC host ↔ Steam Deck guest over WiFi). **Actively looking for
+collaborators** — see [CONTRIBUTING.md](CONTRIBUTING.md) and **[Where help is needed](#where-help-is-needed-)** below.
 
-For general information, go to the [Witcher Online Wiki](https://rejuvenate.gitbook.io/witcheronline).
+💬 Base-mod community: [Witcher Online Discord](https://discord.gg/AGXXvGNnH8)
 
-Special thanks to Werasik2aa for his [multiplayer implementation](https://github.com/werasik2aa/Witcher3-Multiplayer) which helped a lot.
+---
 
-## Features / Playguide
+## Why this fork
 
-Full movement, combat, and appearance sync with other players. Perform emotes and send chat to other players using the player menu or in-game console. Morph into various animals, ride horses and boats with other players.
+The upstream mod is intentionally **presence-only** — you see other players "on the path", but every player
+has their own private copy of the world: NPCs, monsters, quests. This fork goes past that line with a
+**host-authoritative shared world**:
 
-Sit down at tables and benches using Chill Out and change into any character in the game with Custom Player Characters.
+- The **host (PC)** owns the real NPCs and the AI.
+- The **guest (Deck)** hides its own NPCs and instead sees the host's NPCs as synced **"marionette" copies**
+  it can walk among, loot, and fight.
+- The host's single AI is the only authority; guests **mirror** it — no divergent per-client AI.
 
-Co-op, world, and NPC sync is **NOT** implemented.
+## What works today
 
-This mod is designed to turn *The Witcher 3* into an MMO experience, where you can see other players on the path.
+- **Shared NPCs:** the guest renders the host's nearby NPCs with the **correct type & appearance**, pulled
+  from REDkit ground-truth (the `mon_*` ability fingerprint + entity templates), not guesswork — this fixes
+  type collisions like wild_dog vs pet dog. Smooth movement (the base mod's 1-second `SlideTo` mover),
+  rotation, HP, and equipment (weapons in-hand / sheathed on the hip, torches) all sync.
+- **Shared mechanics:** kill-loot by monster type, **cross-device item transfer**, and **time-of-day +
+  weather sync** — all riding a *verbatim exec relay* that breaks WitcherScript's string→name wall via the
+  engine's exec-arg binder (the same trick the console's `additem` uses).
+- **The headline — host NPCs fight the guest:**
+  - Combat **stance + draw + attack-swing** animations mirrored onto the guest's marionettes via slot
+    animations, driven only by the host's synced `IsAttacking()` (no local AI).
+  - Host NPCs actually **commit melee attacks** against the remote-player ghost. The blocker turned out to
+    be W3's combat **ticket system** (`btTicket.ws`): a non-player target that is gameplay-invisible never
+    gets a `TICKET_Melee`, so it only circles. Re-asserting `SetGameplayVisibility(true)` every frame +
+    forcing the combat target unlocks real attacks.
+  - **Damage relayed back to the guest** (floored so you never die in co-op).
 
-[Features](https://rejuvenate.gitbook.io/witcheronline/general-information/features)
+## Architecture
 
-### MMO Experience
+```
+The Witcher 3 (host = PC)                       The Witcher 3 (guest = Deck)
+  WitcherScript mod  ── TCP :37001 ──┐       ┌── TCP :37001 ──  WitcherScript mod
+  WitcherOnlineClient.asi (C++ DLL)  │       │   WitcherOnlineClient.asi
+            └──────── UDP :40000 ────┴───────┴──── UDP :40000 ────────┘
+                            WitcherServer.java (relay — rebroadcasts state)
+```
 
-Join the public server to wander the world with lots of other players.
+- **WitcherScript** has all the game logic but can't network — it emits state via `Log(...)` and receives
+  commands when the DLL injects `exec function` calls.
+- **C++ DLL** bridges the game (debug-scripts TCP) and the relay (UDP).
+- **Java relay** is a dumb rebroadcaster.
 
-![MMO Experience](assets/mmo.gif)
+All the co-op logic lives in
+[`spike_marionette.ws`](witcher/mods/modWitcherOnline/content/scripts/local/spike_marionette.ws).
 
-### Player Riding
+## Where help is needed 🙏
 
-Sit back and relax while other players drive you to your destination.
+- **Netcode reliability (top priority):** the base player-presence sync — the host spawning the guest's
+  "ghost" — is **intermittent across restarts**. Sometimes the host never spawns the guest's ghost and
+  co-op silently breaks, because the whole feature hinges on that ghost existing on the host. Needs people
+  who know the **DLL ↔ relay** path.
+- **WitcherScript / behavior-graph internals:** richer combat mirroring, monster attack anims (the Geralt
+  slot anims only cover humanoids), workspot / action-animation sync.
+- **Testing** on more hardware and with more than two players.
 
-![Player Riding](assets/riding.gif)
+## Build & run
 
-### Vehicle Passengers
+See **[CLAUDE.md](CLAUDE.md)** for exact toolchain paths and build/deploy commands, and **[SPIKE.md](SPIKE.md)**
+for the full design log. Short version:
 
-Ride horses and boats with other players.
+- **Java relay:** `javac -d server/build server/src/*.java && java -cp server/build WitcherServer` (UDP 40000)
+- **C++ DLL:** build `client/MultiplayerClient.sln` (Release / x64) → copy `WitcherOnlineClient.asi` into the
+  game's `bin/x64` + `bin/x64_dx12`.
+- **Mod:** the co-op script is `spike_marionette.ws`; `WO_IS_GUEST()` is the single role flag (PC=false,
+  guest=true). `deploy-coop.ps1` automates the host/guest deploy.
+- **Steam launch options:** `-net -debugscripts`.
 
-![Vehicle Passengers Horse](assets/horse.gif)
+## Design & research docs
 
-![Vehicle Passengers Boat](assets/boat.gif)
+Hard-won knowledge — read before substantial work:
 
-### Item Trading
+| Doc | What's in it |
+|-----|--------------|
+| [SPIKE.md](SPIKE.md) | Canonical design log, WitcherScript gotchas, roadmap. |
+| [COMBAT_AI_RESEARCH.md](COMBAT_AI_RESEARCH.md) | The combat **ticket system** and how host NPCs attack the guest. |
+| [REDKIT_COOP_RESEARCH.md](REDKIT_COOP_RESEARCH.md) | REDkit data findings (types, loot, appearances). |
+| [LEGACY_MOD_STUDY.md](LEGACY_MOD_STUDY.md) | How the base mod's sync / equipment / animation pipeline works. |
+| [CLAUDE.md](CLAUDE.md) | Architecture + build/deploy + WitcherScript gotchas (quick reference). |
 
-Trade items with other players, for a price.
+## Credits
 
-![Item Trading](assets/trading.gif)
+Built on **[Witcher Online](https://github.com/rejuvenate7/WitcherOnline)** by **rejuvenate7** and its
+contributors, which itself builds on **werasik2aa**'s
+[multiplayer implementation](https://github.com/werasik2aa/Witcher3-Multiplayer). The upstream README (base
+mod features, install, MMO mode) is preserved in **[UPSTREAM_README.md](UPSTREAM_README.md)**.
 
-### Morphs
-
-Transform into an owl, crow, fox, or cat.
-
-![Morphs](assets/morphs.gif)
-
-### Emotes
-
-50+ player emotes, some using props.
-
-![Emotes](assets/emotes.gif)
-
-Since only other player locations are synced (not quest progress, NPCs, or the world state), everyone can use their own save file safely.
-
-You can still easily do a full playthrough with each other, just make the same dialog choices and complete quests at the same time as one another.
-
-[Playguide](https://rejuvenate.gitbook.io/witcheronline/general-information/playguide)
-
-## Socials
-
-Join the Discord to report any bugs or issues you encounter with the mod.
-
-- [Discord](https://discord.gg/AGXXvGNnH8)
-- [Wolven Workshop](https://discord.com/invite/RzkhYYr7fk) (`#rejuvenate-rock-farm`)
-- [Wiki](https://rejuvenate.gitbook.io/witcheronline)
-- [YouTube](https://www.youtube.com/@rejuvenate7/videos)
-- [Donate](https://ko-fi.com/rejuvenate)
+This fork is a community effort to take Witcher Online into true co-op. If that's something you want — come
+help. 🐺
