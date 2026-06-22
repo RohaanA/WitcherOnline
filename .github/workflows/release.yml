@@ -3,6 +3,7 @@ name: Auto Build
 on:
   push:
     branches: [ "coop" ]
+    tags: [ "v*.*.*" ]
 
 jobs:
   build:
@@ -50,13 +51,27 @@ jobs:
         Compress-Archive -Path "dist-guest\*" -DestinationPath "WitcherOnline-Guest.zip"
       shell: powershell
 
-    - name: Update Latest Release
+    - name: Determine Release Info
+      id: release_info
+      run: |
+        if ($env:GITHUB_REF -match "^refs/tags/(.*)") {
+            $tag = $matches[1]
+            echo "tag_name=$tag" >> $env:GITHUB_OUTPUT
+            echo "release_name=Release $tag" >> $env:GITHUB_OUTPUT
+            echo "prerelease=false" >> $env:GITHUB_OUTPUT
+        } else {
+            echo "tag_name=latest" >> $env:GITHUB_OUTPUT
+            echo "release_name=Latest Build (Auto)" >> $env:GITHUB_OUTPUT
+            echo "prerelease=true" >> $env:GITHUB_OUTPUT
+        }
+      shell: powershell
+
+    - name: Update Release
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: latest
-        name: "Latest Build (Auto)"
-        body: "Automated build from latest commit."
-        prerelease: true
+        tag_name: ${{ steps.release_info.outputs.tag_name }}
+        name: ${{ steps.release_info.outputs.release_name }}
+        prerelease: ${{ steps.release_info.outputs.prerelease == 'true' }}
         files: |
           WitcherOnline-Host.zip
           WitcherOnline-Guest.zip
