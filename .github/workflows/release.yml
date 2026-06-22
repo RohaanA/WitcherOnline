@@ -1,0 +1,60 @@
+name: Auto Build
+
+on:
+  push:
+    branches: [ "coop" ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up JDK 21
+      uses: actions/setup-java@v3
+      with:
+        java-version: '21'
+        distribution: 'microsoft'
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Run build-dist.ps1 (Host)
+      run: |
+        .\build-dist.ps1
+      shell: powershell
+
+    - name: Rename Host Dist
+      run: |
+        Rename-Item -Path "dist" -NewName "dist-host"
+      shell: powershell
+
+    - name: Run build-dist.ps1 (Guest)
+      run: |
+        .\build-dist.ps1 -Guest
+      shell: powershell
+
+    - name: Rename Guest Dist
+      run: |
+        Rename-Item -Path "dist" -NewName "dist-guest"
+      shell: powershell
+
+    - name: Zip Release Artifacts
+      run: |
+        Compress-Archive -Path "dist-host\*" -DestinationPath "WitcherOnline-Host.zip"
+        Compress-Archive -Path "dist-guest\*" -DestinationPath "WitcherOnline-Guest.zip"
+      shell: powershell
+
+    - name: Update Latest Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: latest
+        name: "Latest Build (Auto)"
+        body: "Automated build from latest commit."
+        prerelease: true
+        files: |
+          WitcherOnline-Host.zip
+          WitcherOnline-Guest.zip

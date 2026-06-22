@@ -161,8 +161,32 @@ function WO_GrantLootForType(t : string)
     if (WO_StartsWith(t, "mon_forktail"))   { WO_GrantItem('Dragon scales', 1); WO_GrantItem('Monstrous blood', 1); return; }
     if (WO_StartsWith(t, "mon_wyvern"))     { WO_GrantItem('Dragon scales', 1); WO_GrantItem('Monstrous blood', 1); return; }
     if (WO_StartsWith(t, "mon_cockatrice")) { WO_GrantItem('Monstrous feather', 1); WO_GrantItem('Monstrous blood', 1); return; }
-    // Known monster fingerprint but unmapped specific -> generic ingredient.
     WO_GrantItem('Monstrous blood', 1);
+}
+
+function WO_GetXpForType(t : string) : int
+{
+    if (t == "" || t == "-") return 0;
+    if (WO_StartsWith(t, "mon_drowner"))    return 15;
+    if (WO_StartsWith(t, "mon_evil_dog"))   return 10;
+    if (WO_StartsWith(t, "mon_werewolf"))   return 50;
+    if (WO_StartsWith(t, "mon_wolf"))       return 10;
+    if (WO_StartsWith(t, "mon_nekker"))     return 15;
+    if (WO_StartsWith(t, "mon_alghoul"))    return 30;
+    if (WO_StartsWith(t, "mon_ghoul"))      return 20;
+    if (WO_StartsWith(t, "mon_rotfiend"))   return 25;
+    if (WO_StartsWith(t, "mon_bear"))       return 30;
+    if (WO_StartsWith(t, "mon_harpy"))      return 20;
+    if (WO_StartsWith(t, "mon_nightwraith"))return 40;
+    if (WO_StartsWith(t, "mon_noonwraith")) return 40;
+    if (WO_StartsWith(t, "mon_wraith"))     return 30;
+    if (WO_StartsWith(t, "mon_fogling"))    return 35;
+    if (WO_StartsWith(t, "mon_water_hag"))  return 35;
+    if (WO_StartsWith(t, "mon_hag"))        return 30;
+    if (WO_StartsWith(t, "mon_forktail"))   return 50;
+    if (WO_StartsWith(t, "mon_wyvern"))     return 50;
+    if (WO_StartsWith(t, "mon_cockatrice")) return 50;
+    return 10;
 }
 
 // Apply the host NPC's EXACT appearance variant (e.g. dog_05, the precise guard outfit) to the
@@ -417,6 +441,7 @@ class WO_SpikeState
     public var ghost_tkt_approach : int;   // ghost approach-ticket override request id
     public var ghost_tkt_active : bool;    // an override is currently issued (clear before re-issue)
     public var ghost_dbg : string;         // HOST combat-target diagnostic (CD=Y/n vis=.. atk=..) for HUD
+    public var party_size : int;           // server-broadcast party size for difficulty scaling
 }
 
 @addField(CR4Game) public var wo_spike_state : WO_SpikeState;
@@ -549,17 +574,83 @@ public function WO_GetHostNpcRegistry() : WO_HostNpcRegistry
 function WO_AssignNpcId(actor : CActor) : int
 {
     var reg : WO_HostNpcRegistry;
-    var i : int;
+    var i, freeSlot : int;
     reg = theGame.WO_GetHostNpcRegistry();
+
+    // Fast path: actor already registered.
     for (i = 0; i < reg.actors.Size(); i += 1)
     {
         if (reg.actors[i] == actor)
             return i + 1;
     }
+
+    // Fix 2: Slot reuse — fills dead/null slots before growing the array.
+    // Prevents unbounded memory growth over long sessions (the registry never shrinks otherwise).
+    freeSlot = -1;
+    for (i = 0; i < reg.actors.Size(); i += 1)
+    {
+        if (!reg.actors[i])
+        {
+            freeSlot = i;
+            break;
+        }
+    }
+
+    if (freeSlot >= 0)
+    {
+        reg.actors[freeSlot] = actor;
+        reg.types[freeSlot] = WO_GetMonsterTypeAbility(actor);
+        reg.held[freeSlot] = WO_HostHeldClass(actor);
+        WO_ScaleNpcHp(actor);
+        return freeSlot + 1;
+    }
+
+    // No free slot: grow the array (only when every slot is occupied by a live NPC).
     reg.actors.PushBack(actor);
-    reg.types.PushBack(WO_GetMonsterTypeAbility(actor));   // compute exact type ONCE per NPC
-    reg.held.PushBack(WO_HostHeldClass(actor));            // compute held-item class ONCE per NPC
+    reg.types.PushBack(WO_GetMonsterTypeAbility(actor));
+    reg.held.PushBack(WO_HostHeldClass(actor));
+    
+    // Scale NPC HP upward based on party size (only host's true NPCs)
+    WO_ScaleNpcHp(actor);
+    
     return reg.actors.Size();
+}
+
+function WO_ScaleNpcHp(actor : CActor)
+{
+    var state : WO_SpikeState;
+    var maxHp : float;
+    state = theGame.WO_GetSpikeState();
+    if (state.party_size > 1 && !actor.HasTag('wo_party_scaled'))
+    {
+        actor.AddTag('wo_party_scaled');
+        maxHp = actor.GetStatMax(BCS_Vitality);
+        actor.AbilityManager().SetStatPointMax(BCS_Vitality, maxHp * state.party_size);
+        actor.ForceSetStat(BCS_Vitality, maxHp * state.party_size);
+    }
+}
+
+// Fix 2: Periodic GC for the host NPC registry. Nulls slots whose actor is no longer
+// alive or valid, freeing them for reuse by WO_AssignNpcId. Runs every ~10s from the
+// render timer (render_tick_count % 600). Logs freed count to scriptslog for verification.
+function WO_HostNpcRegistryGC()
+{
+    var reg : WO_HostNpcRegistry;
+    var i, freed : int;
+    reg = theGame.WO_GetHostNpcRegistry();
+    freed = 0;
+    for (i = 0; i < reg.actors.Size(); i += 1)
+    {
+        if (reg.actors[i] && !reg.actors[i].IsAlive())
+        {
+            reg.actors[i] = NULL;
+            reg.types[i] = "";
+            reg.held[i] = "";
+            freed += 1;
+        }
+    }
+    if (freed > 0)
+        Log("WO_NPC_GC: freed " + freed + " dead slots (registry size=" + reg.actors.Size() + ")");
 }
 
 // Kill switch   false    host emit (  spike #1-3   )
@@ -620,6 +711,15 @@ exec function wo_get_npcs(playerId : string)
     {
         Log("wo_npc");
         return;
+    }
+
+    // Fix 4: Host-side render timer watchdog. DLL calls wo_get_npcs every poll cycle so
+    // this is a reliable bootstrap trigger — fires well before the first jump.
+    if (!thePlayer.HasTag('wo_timers_started'))
+    {
+        thePlayer.AddTag('wo_timers_started');
+        WO_EnsureTimers();
+        GetWitcherPlayer().DisplayHudMessage("WO: timers bootstrapped from host poll");
     }
 
     // Collect NPCs near the host player AND near each guest ghost, so the guest sees
@@ -691,7 +791,15 @@ exec function wo_get_npcs(playerId : string)
         if (n_emitted > 0)
             payload += "|";
         payload += reg.killed[i];
-        payload += " 0 0 0 0 0 0 dead - - - -";   // x y z alive yaw hp appearance type held combat attack ; alive=0
+        
+        // Embed XP value in the hp_pct field of the alive=0 broadcast so guest gets XP
+        var xp : int;
+        if (reg.killed[i] - 1 >= 0 && reg.killed[i] - 1 < reg.types.Size())
+            xp = WO_GetXpForType(reg.types[reg.killed[i] - 1]);
+        else
+            xp = 10;
+            
+        payload += " 0 0 0 0 0 " + IntToString(xp) + " dead - - - -";   // x y z alive yaw hp(XP) appearance type held combat attack
         n_emitted += 1;
     }
     reg.killed.Clear();
@@ -1047,6 +1155,9 @@ function WO_ParseNpcChunk(hostId : string, chunk : string)
                     WO_GrantLootForType(e.npcType);
                 else
                     WO_GrantLootForAppearance(e.appearance);
+                    
+                if (hp_pct > 0)
+                    GetWitcherPlayer().AddPoints( EExperiencePoint, hp_pct, true );
             }
 
             e.actor.SetImmortalityMode(AIM_None, AIC_Default, true);
@@ -1116,6 +1227,18 @@ function WO_ParseNpcChunk(hostId : string, chunk : string)
         if (e.actor && hp_pct >= 0)
             e.actor.SetHealthPerc( hp_pct / 100.0 );
     }
+}
+
+exec function wo_party_update(countStr : string)
+{
+    var state : WO_SpikeState;
+    var count : int;
+    
+    count = StringToInt(countStr);
+    if (count < 1) count = 1;
+    
+    state = theGame.WO_GetSpikeState();
+    state.party_size = count;
 }
 
 exec function wo_npc_update(hostId : string, payload : string)
@@ -1332,6 +1455,10 @@ timer function wo_npc_render60hz(dt : float, id : int)
         else
             WO_MakeGhostsAttackable();   // HOST: let hostile NPCs attack the guest's ghost
 
+        // Fix 2: Host NPC registry GC every ~10s (600 ticks @ 60Hz). Prevents unbounded growth.
+        if (!WO_IS_GUEST() && ss.render_tick_count % 600 == 0)
+            WO_HostNpcRegistryGC();
+
         // Measure NPC update rate (updates/sec across all NPCs) over the elapsed window.
         if (ss.npc_rate_last_time > 0.0 && now > ss.npc_rate_last_time)
         {
@@ -1500,13 +1627,18 @@ function WO_MakeGhostsAttackable()
     }
 }
 
-// Scan nearby actors, hide vanilla on guest. Called from render timer.
+// Scan nearby actors, hide vanilla on guest. Also sweeps for orphaned marionettes
+// (wo_remote_npc entities with no matching live registry entry). Called from render timer.
 function WO_DoGuestCleanup()
 {
     var nearby : array<CActor>;
     var i, hidden : int;
     var a : CActor;
     var ss : WO_SpikeState;
+    var rns : WO_RemoteNpcRegistry;
+    var e : WO_RemoteNpcEntry;
+    var tagEnts : array<CEntity>;
+    var orphanActor : CActor;
 
     ss = theGame.WO_GetSpikeState();
     nearby = GetActorsInRange(thePlayer, 80.0, 100);
@@ -1540,6 +1672,23 @@ function WO_DoGuestCleanup()
         hidden += 1;
     }
     ss.cleanup_total_hidden += hidden;
+
+    // Fix 3: Orphan marionette GC. Destroy any wo_remote_npc entity whose actor handle is
+    // no longer tracked in the remote NPC registry. This catches entities that were not
+    // properly cleaned up on rapid test-cycle resets (fast jumps etc.).
+    rns = theGame.WO_GetRemoteNpcState();
+    theGame.GetEntitiesByTag('wo_remote_npc', tagEnts);
+    for (i = 0; i < tagEnts.Size(); i += 1)
+    {
+        orphanActor = (CActor)tagEnts[i];
+        if (!orphanActor) continue;
+        e = WO_FindRemoteByActor(orphanActor);
+        if (!e)
+        {
+            // No registry entry — this is a leaked marionette. Destroy it.
+            orphanActor.Destroy();
+        }
+    }
 }
 
 // (cleanup folded into wo_npc_render60hz — see WO_DoGuestCleanup above)

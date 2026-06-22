@@ -64,7 +64,7 @@ public class WitcherServer
 
         Thread recvThread = startThread("udp-recv", () -> receiveLoop(socket));
         Thread sendThread = startThread("udp-broadcast", () -> broadcastLoop(socket));
-        Thread cleanupThread = startThread("udp-cleanup", WitcherServer::cleanupLoop);
+        Thread cleanupThread = startThread("udp-cleanup", () -> cleanupLoop(socket));
         Thread consoleThread = startThread("console", () -> consoleLoop(socket));
 
         recvThread.join();
@@ -156,18 +156,28 @@ public class WitcherServer
 
         String opcode = parts[0];
 
-        // UPDATE_HIT and UPDATE_EXEC — transient one-shot events. Broadcast immediately, no
-        // per-session storage (replaying every tick would re-fire the action). UPDATE_EXEC
-        // carries a verbatim exec string (e.g. give-item) the receiver's DLL injects.
+        // UPDATE_HIT and UPDATE_EXEC — transient one-shot events. Broadcast immediately.
+        // UPDATE_EXEC also stores the payload in the sender's session so late-joining clients
+        // receive a world snapshot (all stored exec payloads) on connect, fixing intermittent
+        // ghost spawn failures caused by dropped or missed one-shot packets.
         if ("UPDATE_HIT".equals(opcode) || "UPDATE_EXEC".equals(opcode))
         {
             List<ClientEndpoint> recipients = snapshotRecipients();
             if ("UPDATE_EXEC".equals(opcode))
             {
+                String execSender = parts.length > 1 ? parts[1] : "";
+                String execPayload = parts.length > 2 ? parts[2] : "";
                 dbg("UPDATE_EXEC from %s -> broadcast to %d recipient(s): %s\n",
-                        parts.length > 1 ? parts[1] : "?",
-                        recipients.size(),
-                        parts.length > 2 ? parts[2] : "");
+                        execSender, recipients.size(), execPayload);
+
+                // Store in the sender's session for world-snapshot replay on new joins.
+                if (!execSender.isEmpty())
+                {
+                    String execSenderKey = normalizeUsernameKey(execSender);
+                    PlayerSession execSession = players.get(execSenderKey);
+                    if (execSession != null)
+                        execSession.lastExecPayload = msg;
+                }
             }
             byte[] data = msg.getBytes(StandardCharsets.UTF_8);
             for (ClientEndpoint client : recipients)
@@ -280,6 +290,11 @@ public class WitcherServer
             {
                 current = created;
                 dbg("Accepted username %s for %s\n", username, sender);
+                // Ghost spawn reliability: send all existing players' stored exec payloads
+                // to the newly-joined client so it gets an immediate world snapshot.
+                sendWorldSnapshot(socket, sender, usernameKey);
+                // Party system: notify all clients of the new party size.
+                broadcastPartyUpdate(socket);
             }
             else
             {
@@ -334,7 +349,7 @@ public class WitcherServer
         }
     }
 
-    private static void cleanupLoop()
+    private static void cleanupLoop(DatagramSocket socket)
     {
         while (running.get())
         {
@@ -347,7 +362,11 @@ public class WitcherServer
                     PlayerSession session = entry.getValue();
                     if ((now - session.lastSeen) > PLAYER_TIMEOUT_NANOS)
                     {
-                        reserveTimedOutPlayer(entry.getKey(), session, now);
+                        if (reserveTimedOutPlayer(entry.getKey(), session, now))
+                        {
+                            // Party system: notify all clients of the new party size.
+                            broadcastPartyUpdate(socket);
+                        }
                     }
                 }
 
@@ -438,6 +457,41 @@ public class WitcherServer
             unique.add(session.endpoint);
         }
         return new ArrayList<>(unique);
+    }
+
+    /**
+     * Ghost spawn reliability: replays every active player's stored UPDATE_EXEC payload to a
+     * newly-joined client. This ensures that even if the client connected after the host's ghost
+     * spawn packet was broadcast (or if that UDP packet dropped), the client still gets all spawn
+     * exec strings and sees every player's ghost. Excludes the new player's own session (excludeKey).
+     */
+    private static void sendWorldSnapshot(DatagramSocket socket, ClientEndpoint newClient, String excludeKey)
+    {
+        int sent = 0;
+        for (Map.Entry<String, PlayerSession> entry : players.entrySet())
+        {
+            if (entry.getKey().equals(excludeKey))
+                continue;
+
+            String payload = entry.getValue().lastExecPayload;
+            if (payload == null || payload.isEmpty())
+                continue;
+
+            try
+            {
+                byte[] data = payload.getBytes(StandardCharsets.UTF_8);
+                socket.send(new DatagramPacket(data, data.length, newClient.address, newClient.port));
+                totalPacketsSent.incrementAndGet();
+                sent++;
+            }
+            catch (Exception e)
+            {
+                totalSendFailures.incrementAndGet();
+                dbg("sendWorldSnapshot send failed to %s: %s\n", newClient, e.toString());
+            }
+        }
+        if (sent > 0)
+            dbg("sendWorldSnapshot: sent %d exec payloads to %s\n", sent, newClient);
     }
 
     private static int broadcastChunk(
@@ -775,6 +829,8 @@ public class WitcherServer
         if (removed != null)
         {
             safeSend(socket, removed.endpoint, kickText);
+            // Party system: notify all clients of the new party size.
+            broadcastPartyUpdate(socket);
         }
     }
 
@@ -1346,5 +1402,24 @@ public class WitcherServer
                 ip);
 
         return true;
+    }
+
+    private static void broadcastPartyUpdate(DatagramSocket socket)
+    {
+        int count = players.size();
+        String payload = "UPDATE_PARTY\tSERVER\t" + count;
+        byte[] data = payload.getBytes(StandardCharsets.UTF_8);
+        for (PlayerSession session : players.values())
+        {
+            try
+            {
+                socket.send(new DatagramPacket(data, data.length, session.endpoint.address, session.endpoint.port));
+                totalPacketsSent.incrementAndGet();
+            }
+            catch (Exception e)
+            {
+                totalSendFailures.incrementAndGet();
+            }
+        }
     }
 }

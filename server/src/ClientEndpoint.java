@@ -13,7 +13,8 @@ public class ClientEndpoint {
     @Override
     public boolean equals(Object obj) {
         if (this == obj) return true;
-        if (!(obj instanceof ClientEndpoint other)) return false;
+        if (!(obj instanceof ClientEndpoint)) return false;
+        ClientEndpoint other = (ClientEndpoint) obj;
         return port == other.port && Objects.equals(address, other.address);
     }
 

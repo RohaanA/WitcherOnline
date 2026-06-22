@@ -17,6 +17,10 @@
 namespace fs = std::filesystem;
 using namespace w3mp;
 
+// Set to 1 to enable verbose file logging to C:\witcher_dll_log.txt.
+// Keep at 0 for release builds — file I/O in the hot path adds measurable latency.
+#define WO_DEBUG 0
+
 static DebugExecClient g_client;
 static std::thread g_poll;
 static std::thread g_game;
@@ -456,6 +460,23 @@ static void HandleServerPacket(const std::string& msg)
 		SendOneShotExec(code);
 		return;
 	}
+	else if (parts[0] == "UPDATE_PARTY")
+	{
+		// parts[1] = SERVER, parts[2] = player count
+		if (parts.size() < 3)
+			return;
+
+		const std::string& countStr = parts[2];
+		if (countStr.empty())
+			return;
+
+		std::string code = "wo_party_update(\"";
+		code += EscapeExecQuoted(countStr, '"');
+		code += "\")";
+
+		SendOneShotExec(code);
+		return;
+	}
 	else if (parts[0] == "UPDATE_EXEC")
 	{
 		// Verbatim exec relay: parts[2] = '|'-separated exec strings to inject as-is.
@@ -620,32 +641,44 @@ static bool SendOneShotExec(const std::string& code)
 }
 
 static void PollPoseThread() {
+#if WO_DEBUG
 	LogStep("PollPoseThread: ENTER");
+#endif
 	Sleep(500);
+#if WO_DEBUG
 	LogStep("PollPoseThread: after sleep, entering main loop");
+#endif
 	using clock = std::chrono::steady_clock;
 	auto lastDebugLog = clock::now();
 	int iterLog = 0;
 
 	while (g_run.load()) {
+#if WO_DEBUG
 		if (iterLog < 5) { LogStep("PPT: A. loop top"); }
+#endif
 		// File log every 3 sec to see if poll runs and g_client status
 		auto now = clock::now();
+#if WO_DEBUG
 		if (now - lastDebugLog > std::chrono::seconds(3)) {
 			std::string s = "PollPoseTick: g_client.IsConnected=";
 			s += g_client.IsConnected() ? "TRUE" : "FALSE";
 			LogStep(s.c_str());
 			lastDebugLog = now;
 		}
+#endif
+#if WO_DEBUG
 		if (iterLog < 5) { LogStep("PPT: B. after time check"); }
 		if (iterLog < 5) { LogStep("PPT: B1. about to try block"); }
+#endif
 
 
 		try
 		{
+#if WO_DEBUG
 			if (iterLog < 5) { LogStep("PPT: B2. in try"); }
 			// DECK: skip mutex+drain (suspect mutex on Wine)
 			if (iterLog < 5) { LogStep("PPT: B5. after drain block (skipped)"); }
+#endif
 
 			if (g_client.IsConnected() && g_usernameTaken.load())
 			{
@@ -763,22 +796,30 @@ static void PollPoseThread() {
 		}
 		catch (const std::exception& e)
 		{
+#if WO_DEBUG
 			std::string s = "PPT: caught std::exception: ";
 			s += e.what();
 			LogStep(s.c_str());
+#endif
 		}
 		catch (...)
 		{
+#if WO_DEBUG
 			LogStep("PPT: caught unknown exception");
+#endif
 		}
 	}
 }
 
 static void SendToGameThread()
 {
+#if WO_DEBUG
 	LogStep("SendToGameThread: ENTER");
+#endif
 	Sleep(1000);
+#if WO_DEBUG
 	LogStep("SendToGameThread: after sleep, entering recv loop");
+#endif
 	std::vector<char> data(8192);
 
 	int tick = 0;
@@ -786,7 +827,9 @@ static void SendToGameThread()
 	{
 		try
 		{
+#if WO_DEBUG
 			if (tick < 3) { LogStep("SendToGameThread: about to recv_from"); }
+#endif
 			asio::ip::udp::endpoint senderEndpoint;
 
 			std::size_t len = theSocket.receive_from(
@@ -797,24 +840,32 @@ static void SendToGameThread()
 
 			std::string msg(data.data(), len);
 			HandleServerPacket(msg);
+#if WO_DEBUG
+			if (tick < 3) { LogStep("SendToGameThread: recv_from returned"); }
+#endif
 		}
 		catch (const std::exception& e) {
+#if WO_DEBUG
 			std::string s = "SendToGameThread recv exception: ";
 			s += e.what();
 			LogStep(s.c_str());
+#endif
 			Sleep(500);
 		}
 		catch (...) {
+#if WO_DEBUG
 			LogStep("SendToGameThread unknown exception");
+#endif
 			Sleep(500);
 		}
 		tick++;
 	}
 }
 
-// Wine-friendly file logger.
+// Wine-friendly file logger. Compiled away when WO_DEBUG=0.
 static void LogStep(const char* msg)
 {
+#if WO_DEBUG
 	FILE* f = nullptr;
 	fopen_s(&f, "C:\\witcher_dll_log.txt", "a");
 	if (f)
@@ -822,11 +873,16 @@ static void LogStep(const char* msg)
 		fprintf(f, "%s\n", msg);
 		fclose(f);
 	}
+#else
+	(void)msg;  // suppress unused-parameter warning in release
+#endif
 }
 
 void initScript()
 {
+#if WO_DEBUG
 	LogStep("S0: enter initScript");
+#endif
 
 	// Skip when not running inside the main game exe (launcher.exe etc load dinput8 too).
 	{
