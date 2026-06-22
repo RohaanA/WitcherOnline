@@ -40,6 +40,30 @@ has their own private copy of the world: NPCs, monsters, quests. This fork goes 
     forcing the combat target unlocks real attacks.
   - **Damage relayed back to the guest** (floored so you never die in co-op).
 
+## Installation & Setup
+
+You do not need to build the mod yourself. Download the ready-to-play files from the **[Releases](../../releases)** tab on GitHub.
+
+### 1. Download Files
+- **For the Host (PC):** Download `WitcherOnline-Host.zip`
+- **For the Guest (Deck/Friend):** Download `WitcherOnline-Guest.zip`
+
+### 2. Network Setup (Tailscale Example)
+Since the server uses UDP port 40000, the easiest way to play together without port forwarding your router is using a free Virtual LAN tool like [Tailscale](https://tailscale.com/).
+1. Both the Host and the Guest must install Tailscale and log in to the same Tailscale network.
+2. Once connected, copy the **Host's Tailscale IP Address** (it usually starts with `100.x.x.x`).
+
+### 3. Install the Mod
+1. Extract your downloaded zip file.
+2. Copy the **contents** of the `game` folder directly into your Witcher 3 installation directory (e.g., `C:\Program Files (x86)\Steam\steamapps\common\The Witcher 3\`).
+3. Open `<game_directory>\bin\WitcherOnline\config.xml` in a text editor.
+   - **Host:** Set `<ServerIP>` to `127.0.0.1`
+   - **Guest:** Set `<ServerIP>` to the **Host's Tailscale IP Address**.
+4. In Steam, right-click The Witcher 3 -> Properties -> Launch Options, and add: `-net -debugscripts`
+
+### 4. Start the Server (Host Only)
+Extract the `server` folder anywhere on your PC. Double-click `start_server.bat` to launch the relay server. Keep this window open while playing!
+
 ## Architecture
 
 ```
